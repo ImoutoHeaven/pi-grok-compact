@@ -4,7 +4,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createCheckpoint, latestCheckpoint, projectMessages, replay, summary } from "./checkpoint.ts";
 import { capturePayload, GrokCompactionError, isGrok, requestCompaction, resolveRoute, routeIdentity } from "./remote.ts";
-import { assertOAuthReplay, createOAuthReplayRouter, oauthCompactRoute, oauthState } from "./oauth.ts";
+import { assertCheckpointAuth, capabilityKey, createOAuthReplayRouter, oauthCompactRoute, oauthState } from "./oauth.ts";
 
 function keptMessages(event: SessionBeforeCompactEvent) {
   const entries = buildContextEntries(event.branchEntries, event.branchEntries.at(-1)?.id ?? null);
@@ -18,6 +18,8 @@ export function createGrokCompaction(options: {
 } = {}) {
   return (pi: ExtensionAPI) => {
     const installReplayRouter = createOAuthReplayRouter(pi);
+    let capabilitySession: string | undefined;
+    const unavailable = new Map<string, number>();
     const active = (ctx: ExtensionContext) => latestCheckpoint(ctx.sessionManager.getBranch());
     const compatible = (ctx: ExtensionContext, route: string) => isGrok(ctx.model) && routeIdentity(ctx.model) === route;
 
@@ -25,8 +27,11 @@ export function createGrokCompaction(options: {
       if (!isGrok(ctx.model)) return;
       const model = ctx.model;
       const sessionId = ctx.sessionManager.getSessionId();
+      if (capabilitySession !== sessionId) { unavailable.clear(); capabilitySession = sessionId; }
+      for (const [key, expiry] of unavailable) if (expiry <= Date.now()) unavailable.delete(key);
       const leafId = ctx.sessionManager.getLeafId();
       let routeId: string;
+      let fallbackKey: string | undefined;
       const owned = () => !event.signal.aborted && ctx.sessionManager.getSessionId() === sessionId &&
         ctx.sessionManager.getLeafId() === leafId && ctx.model !== undefined && routeIdentity(ctx.model) === routeId;
       ctx.ui.setStatus("grok-compact", "Grok server compaction…");
@@ -39,15 +44,21 @@ export function createGrokCompaction(options: {
         const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
         if (!owned()) return { cancel: true };
         if (!auth.ok) throw new Error("Grok provider authentication is unavailable");
-        const oauth = oauthState(model, auth, ctx.modelRegistry.isUsingOAuth(model));
-        if (prior?.oauthAccount && !oauth) throw new GrokCompactionError("This native checkpoint requires its original OAuth login; restore that login before compacting.");
+        const usingOAuth = ctx.modelRegistry.isUsingOAuth(model);
+        const oauth = oauthState(model, auth, usingOAuth);
+        if (prior) assertCheckpointAuth(prior, usingOAuth, oauth);
         installReplayRouter(ctx);
         if (oauth?.tier === "free") {
-          if (prior) assertOAuthReplay(prior, oauth);
           ctx.ui.notify("Free/X Basic OAuth account: using Pi's built-in prompt-summary compaction.", "info");
           return undefined;
         }
-        if (prior && oauth) assertOAuthReplay(prior, oauth);
+        if (!prior && oauth) {
+          fallbackKey = capabilityKey(model, oauth);
+          if (unavailable.has(fallbackKey)) {
+            ctx.ui.notify("Native compaction is temporarily unavailable for this credential and model; using Pi prompt-summary.", "info");
+            return undefined;
+          }
+        }
         const provider = ctx.modelRegistry.getProvider(model.provider);
         if (!provider) throw new Error("Grok provider is unavailable");
         const captured = await capturePayload({
@@ -64,12 +75,18 @@ export function createGrokCompaction(options: {
           signal: event.signal, fetch: options.fetch,
         });
         if (!owned()) return { cancel: true };
-        const details = createCheckpoint(routeId, result.output, keptMessages(event), oauth?.account);
+        const details = createCheckpoint(routeId, result.output, keptMessages(event), usingOAuth ? "oauth" : "non-oauth", oauth?.account);
         return { compaction: {
           summary: summary(details.checkpointId), firstKeptEntryId: event.preparation.firstKeptEntryId,
           tokensBefore: event.preparation.tokensBefore, details,
         } };
       } catch (error) {
+        if (fallbackKey && error instanceof GrokCompactionError &&
+            (error.kind === "entitlement" || error.kind === "unsupported") && owned()) {
+          unavailable.set(fallbackKey, Date.now() + 5 * 60_000);
+          ctx.ui.notify("Native compaction capability was denied; using Pi's built-in prompt-summary compaction.", "warning");
+          return undefined;
+        }
         // Surface locally authored errors; provider errors can echo bodies or credentials.
         if (!event.signal.aborted) ctx.ui.notify(error instanceof GrokCompactionError ? error.message : "Grok server compaction failed; original history retained. Check the endpoint, credentials and context limit, then retry /compact.", "warning");
         return { cancel: true };
@@ -99,7 +116,7 @@ export function createGrokCompaction(options: {
       }
     };
     pi.on("model_select", warnRoute);
-    pi.on("session_start", warnRoute);
+    pi.on("session_start", (event, ctx) => { unavailable.clear(); warnRoute(event, ctx); });
   };
 }
 

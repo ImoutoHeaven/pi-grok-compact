@@ -14,7 +14,32 @@ export function baseUrl(value: string): string {
   return url.href.replace(/\/+$/, "").replace(/\/responses$/, "");
 }
 
-export class GrokCompactionError extends Error {}
+export type CompactFailure = "auth" | "entitlement" | "quota" | "rate_limit" | "unsupported" | "transport" | "protocol";
+
+export class GrokCompactionError extends Error {
+  readonly kind: CompactFailure;
+  readonly status?: number;
+  constructor(message: string, kind: CompactFailure = "protocol", status?: number) {
+    super(message);
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+function classifyFailure(status: number, body: unknown): CompactFailure {
+  const nested = isObject(body) && isObject(body.error) ? body.error : body;
+  const code = isObject(nested) && typeof nested.code === "string" ? nested.code.toLowerCase() : "";
+  const message = isObject(nested) && typeof nested.message === "string" ? nested.message :
+    isObject(body) && typeof body.error === "string" ? body.error : "";
+  if (status === 401) return "auth";
+  if (status === 402 || ["subscription:free-usage-exhausted", "insufficient_quota", "billing_quota_exceeded"].includes(code)) return "quota";
+  if (status === 429) return "rate_limit";
+  if (status === 403 && (["entitlement_unavailable", "insufficient_entitlement", "compaction_entitlement_required"].includes(code) ||
+      (["", "permission-denied", "permission_denied", "forbidden"].includes(code) &&
+       /\bentitlement\b/i.test(message) && /\b(unavailable|missing|required|denied|insufficient)\b/i.test(message)))) return "entitlement";
+  if ([400, 404, 405, 501].includes(status) && ["unsupported_endpoint", "unsupported_operation", "compaction_not_supported"].includes(code)) return "unsupported";
+  return status >= 500 ? "transport" : "protocol";
+}
 
 export function routeIdentity(model: Model<Api>): string {
   return JSON.stringify([model.provider, model.api, model.id, baseUrl(model.baseUrl)]);
@@ -102,17 +127,20 @@ export async function requestCompaction(options: {
     body: JSON.stringify({ model: options.model, input: options.input, prompt_cache_key: options.sessionId, instructions: options.instructions }),
   });
   if (!response.ok) {
-    let code: unknown;
+    let body: unknown;
     try {
-      const error = await readJson(response);
-      if (isObject(error)) code = isObject(error.error) ? error.error.code : error.code;
+      body = await readJson(response);
     } catch { /* HTTP status remains available for empty or malformed error bodies. */ }
-    const reason = code === "subscription:free-usage-exhausted" ? "Free usage exhausted; wait for quota recovery" :
-      response.status === 401 ? "OAuth or API credentials were rejected; sign in again" :
+    const kind = classifyFailure(response.status, body);
+    const nested = isObject(body) && isObject(body.error) ? body.error : body;
+    const reason = isObject(nested) && nested.code === "subscription:free-usage-exhausted" ? "Free usage exhausted; wait for quota recovery" :
+      kind === "auth" ? "OAuth or API credentials were rejected; sign in again" :
       response.status === 402 ? "Subscription credits or spending limit exhausted" :
-      response.status === 403 ? "The account lacks access to native compaction" :
-      response.status === 429 ? "Rate limited; retry after the provider's cooldown" : "Native compaction request failed";
-    throw new GrokCompactionError(`${reason} (HTTP ${response.status}); history retained.`);
+      kind === "entitlement" ? "Native compaction entitlement unavailable" :
+      kind === "quota" ? "Provider quota exhausted" :
+      kind === "rate_limit" ? "Rate limited; retry after the provider's cooldown" :
+      kind === "unsupported" ? "The endpoint does not support native compaction" : "Native compaction request failed";
+    throw new GrokCompactionError(`${reason} (HTTP ${response.status}); history retained.`, kind, response.status);
   }
   const data = await readJson(response);
   signal.throwIfAborted();

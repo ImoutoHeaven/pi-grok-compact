@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
-import { isObject, latestCheckpoint, type Checkpoint } from "./checkpoint.ts";
+import { checkpointAuthKind, isObject, latestCheckpoint, type Checkpoint } from "./checkpoint.ts";
 import { baseUrl, GrokCompactionError, isGrok, resolveRoute, routeIdentity } from "./remote.ts";
 
 const XAI_API = "https://api.x.ai/v1";
@@ -57,21 +57,36 @@ export function oauthCompactRoute(state: OAuthState): ReturnType<typeof resolveR
   return { url: `${XAI_API}/responses/compact`, headers: apiHeaders(state.authorization, "application/json") };
 }
 
-export function assertOAuthReplay(checkpoint: Checkpoint, state: OAuthState): void {
-  if (state.tier === "free") {
+export function capabilityKey(model: Model<Api>, state: OAuthState): string {
+  return `${routeIdentity(model)}:${createHash("sha256").update(state.authorization).digest("hex")}`;
+}
+
+export function assertCheckpointAuth(checkpoint: Checkpoint, usingOAuth: boolean, state?: OAuthState): void {
+  const kind = checkpointAuthKind(checkpoint);
+  if (kind === "unknown") {
+    throw new GrokCompactionError("This v1 checkpoint has unknown authentication. Use Pi /tree to select a pre-compaction node and create a v2 checkpoint; keep the session file.");
+  }
+  if (kind === "oauth" && !usingOAuth) {
+    throw new GrokCompactionError("This native checkpoint requires its original OAuth login; restore that login before replaying or compacting.");
+  }
+  if (state?.tier === "free") {
     throw new GrokCompactionError("This native checkpoint requires a paid account. Restore the original paid account; Free/X Basic sessions use Pi prompt-summary.");
   }
-  if (checkpoint.oauthAccount && checkpoint.oauthAccount !== state.account) {
+  if (checkpoint.oauthAccount && checkpoint.oauthAccount !== state?.account) {
     throw new GrokCompactionError("This native checkpoint belongs to a different OAuth account. Restore its original login before replaying.");
   }
 }
 
 export function createOAuthReplayRouter(pi: ExtensionAPI): (ctx: ExtensionContext) => void {
   const installed = new Map<string, ProviderConfig["streamSimple"]>();
+  let warningSession: string | undefined;
+  const warned = new Set<string>();
   return ctx => {
     const model = ctx.model;
-    if (!isDirectOAuth(model, true)) return;
-    if (!ctx.modelRegistry.isUsingOAuth(model) && !latestCheckpoint(ctx.sessionManager.getBranch())?.oauthAccount) return;
+    if (!isGrok(model)) return;
+    const active = latestCheckpoint(ctx.sessionManager.getBranch());
+    const needsGuard = active && active.route === routeIdentity(model) && checkpointAuthKind(active) !== "non-oauth";
+    if (!isDirectOAuth(model, ctx.modelRegistry.isUsingOAuth(model)) && !needsGuard) return;
     const config = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
     if (installed.has(model.provider) && config?.streamSimple === installed.get(model.provider)) return;
     const original = ctx.modelRegistry.getProvider(model.provider);
@@ -82,14 +97,22 @@ export function createOAuthReplayRouter(pi: ExtensionAPI): (ctx: ExtensionContex
         ...options,
         onPayload: async (payload, requestModel) => {
           const next = await options.onPayload?.(payload, requestModel) ?? payload;
-          const state = oauthState(currentModel, options, ctx.modelRegistry.isUsingOAuth(currentModel));
+          const usingOAuth = ctx.modelRegistry.isUsingOAuth(currentModel);
+          const state = oauthState(currentModel, options, usingOAuth);
           destination = state?.tier === "free" ? XAI_CLI : undefined;
           const checkpoint = latestCheckpoint(ctx.sessionManager.getBranch());
           if (checkpoint && checkpoint.route === routeIdentity(currentModel) &&
               isObject(next) && Array.isArray(next.input) && next.input.some(item => isObject(item) && item.type === "compaction")) {
-            if (checkpoint.oauthAccount && !state) throw new GrokCompactionError("This native checkpoint requires its original OAuth login; restore that login before replaying.");
+            assertCheckpointAuth(checkpoint, usingOAuth, state);
+            if (checkpointAuthKind(checkpoint) === "oauth" && !checkpoint.oauthAccount) {
+              const session = ctx.sessionManager.getSessionId();
+              if (warningSession !== session) { warned.clear(); warningSession = session; }
+              if (!warned.has(checkpoint.checkpointId)) {
+                ctx.ui.notify("OAuth checkpoint has no stable account identity. Keep using the original account; account consistency cannot be verified.", "warning");
+                warned.add(checkpoint.checkpointId);
+              }
+            }
             if (state) {
-              assertOAuthReplay(checkpoint, state);
               destination = XAI_API;
             }
           }

@@ -7,14 +7,23 @@ export type Item = Record<string, unknown>;
 export const MAX_BYTES = 8 * 1024 * 1024;
 const KIND = "pi-grok-native-compaction";
 
-export interface Checkpoint {
+export type AuthKind = "oauth" | "non-oauth";
+
+interface CheckpointData {
   kind: typeof KIND;
-  version: 1;
   checkpointId: string;
   route: string;
   output: Item[];
   keptMessageFingerprints: string[];
   oauthAccount?: string;
+}
+
+export type Checkpoint = CheckpointData & (
+  { version: 1; authKind?: never } | { version: 2; authKind: AuthKind }
+);
+
+export function checkpointAuthKind(checkpoint: Checkpoint): AuthKind | "unknown" {
+  return checkpoint.version === 2 ? checkpoint.authKind : checkpoint.oauthAccount ? "oauth" : "unknown";
 }
 
 export function isObject(value: unknown): value is Item {
@@ -49,9 +58,10 @@ export function marker(id: string): string {
   return `[PI_GROK_CHECKPOINT:${id}] Opaque history requires pi-grok-compaction on the original route. Report unavailable history if this marker reaches the model.`;
 }
 
-export function createCheckpoint(route: string, output: unknown, kept: readonly AgentMessage[], oauthAccount?: string): Checkpoint {
+export function createCheckpoint(route: string, output: unknown, kept: readonly AgentMessage[], authKind: AuthKind, oauthAccount?: string): Checkpoint {
+  if (authKind === "non-oauth" && oauthAccount) throw new Error("Non-OAuth checkpoints cannot carry an OAuth account");
   return {
-    kind: KIND, version: 1, checkpointId: randomUUID(), route,
+    kind: KIND, version: 2, authKind, checkpointId: randomUUID(), route,
     output: validateOutput(output), keptMessageFingerprints: kept.map(fingerprint),
     ...(oauthAccount ? { oauthAccount } : {}),
   };
@@ -63,7 +73,11 @@ export function latestCheckpoint(entries: readonly SessionEntry[]): Checkpoint |
     if (entry.type !== "compaction") continue;
     const value = entry.details;
     if (!isObject(value) || value.kind !== KIND) return undefined;
-    if (value.version !== 1 || typeof value.checkpointId !== "string" ||
+    if ((value.version !== 1 && value.version !== 2) ||
+        (value.version === 1 && value.authKind !== undefined) ||
+        (value.version === 2 && value.authKind !== "oauth" && value.authKind !== "non-oauth") ||
+        (value.authKind === "non-oauth" && value.oauthAccount !== undefined) ||
+        typeof value.checkpointId !== "string" ||
         !/^[a-f0-9-]{36}$/.test(value.checkpointId) || typeof value.route !== "string" ||
         (value.oauthAccount !== undefined && (typeof value.oauthAccount !== "string" || !/^[a-f0-9]{64}$/.test(value.oauthAccount))) ||
         !Array.isArray(value.keptMessageFingerprints) ||

@@ -1,8 +1,8 @@
 # Pi Grok compaction
 
-为 Pi 的 `grok-*` 模型提供原生 xAI 服务端压缩和免费 OAuth 账户的 Pi 内置摘要回退，使用 `openai-responses` transport。
+为 Pi 的 `grok-*` 模型提供原生 xAI 服务端压缩，以及免费 OAuth 或明确能力拒绝时的 Pi 内置摘要回退，使用 `openai-responses` transport。
 支持 Pi 官方 xAI OAuth 登录、`pi-grok` 等第三方 OAuth 登录插件，以及 CLIProxyAPI 等 Responses 中转；provider 名称与认证来源由 Pi 配置决定。
-Checkpoint 投影使用会话摘要标记与保留消息指纹，相关衍生代码遵循 [MIT 许可](LICENSE) 中的版权声明。
+采用 [MIT 许可](LICENSE)。
 
 ## 使用
 
@@ -16,9 +16,9 @@ CLIProxy 的本地地址示例为 `http://127.0.0.1:8317/v1`。
 pi -e ./src/index.ts
 ```
 
-Pi 的 `/compact` 与自动压缩事件均调用此扩展。自动触发时机由现有 Pi
+Pi 的 `/compact` 与自动压缩事件均调用此扩展。自动触发时机由 Pi
 `compaction.reserveTokens` 设置决定；应在模型上下文窗口内预留压缩空间。
-现有 GPT compaction 扩展可同时加载，分别处理 `gpt-*` 与 `grok-*`。
+可与仅处理 `gpt-*` 的 compaction 扩展同时加载；每个模型应由一个扩展负责压缩。
 
 需要跨目录加载时，将本扩展的绝对路径加入 Pi 用户设置 `extensions` 数组，
 例如 `/path/to/pi-grok-compaction/src/index.ts`，替换为实际安装路径。恢复已压缩会话时持续加载本扩展。
@@ -37,19 +37,39 @@ Pi 0.84.2 的部分内置 Grok 模型默认使用 Chat Completions，需要配�
 | API key 或第三方中转 | 当前端点 `/responses/compact` | 当前端点 `/responses` |
 
 直接 OAuth 路由适用于 Pi 确认使用 OAuth，且模型端点是 `api.x.ai/v1` 或
-`cli-chat-proxy.grok.com/v1` 的连接。摘要回退适用于明确识别的直接免费 OAuth 账户；
-中转的凭据与上游账户策略由中转管理。
+`cli-chat-proxy.grok.com/v1` 的连接。中转的凭据与上游账户策略由中转管理。
 
-账户等级取自 Pi 当前解析出的 OAuth JWT `tier`；Free 和 X Basic 进入摘要回退。
-原生压缩的权限由服务端验证。免费账户的 CLI 请求使用 provider 已有的客户端版本，
+账户等级取自 Pi 解析出的 OAuth JWT `tier`；Free 和 X Basic 进入摘要回退。
+原生压缩的权限由服务端验证。免费账户的 CLI 请求使用 provider 提供的客户端版本，
 或 `PI_XAI_CLIENT_VERSION`，默认 `0.2.101`。
 
 Pi 内置 prompt-summary 通过普通 Responses 请求由远端模型生成可读摘要，
 Pi 负责组织提示词、保存摘要和管理后续上下文。
 
-OAuth 原生 checkpoint 在可获得账户标识时保存其哈希，并使用刷新后的凭据恢复。
-切换账户、改用 API key 或降为免费账户后，已有的此类 checkpoint 要求恢复原付费登录；
-会话保留在磁盘上。免费账户创建的摘要会话可正常继续。
+checkpoint 使用 v2 格式，`authKind` 记录 Pi 的认证类型，包括自定义 OAuth 中转。
+
+| checkpoint 状态 | 恢复条件 |
+| --- | --- |
+| v2，`authKind: "non-oauth"` | provider、模型和端点匹配 |
+| v2，`authKind: "oauth"`，账户指纹已知 | OAuth 登录与账户指纹匹配 |
+| v2，`authKind: "oauth"`，账户指纹未知 | OAuth 登录；每个会话、checkpoint 提示一次身份核对限制 |
+| v1，含 `oauthAccount` | 按 OAuth 读取，要求账户指纹匹配 |
+| v1，认证来源未知 | 阻止自动回放和再次压缩；通过 Pi `/tree` 选择压缩前节点后创建 v2 checkpoint |
+
+native checkpoint 要求具备原生压缩权限的账户；免费账户使用可读摘要会话。
+会话日志保留在磁盘上。
+
+## 能力拒绝与摘要回退
+
+直接 OAuth 账户尚无 native checkpoint 时，明确的 compact entitlement 拒绝或
+endpoint 不支持会交给 Pi 内置摘要。未知等级先尝试 native；能力拒绝只影响压缩策略。
+摘要请求沿用 provider 的普通推理路径，已识别的免费账户使用 CLI chat proxy。
+
+能力拒绝缓存限定在会话、模型、端点和访问凭据，保留 5 分钟。
+凭据变化、会话切换或 `/reload` 可重新探测；缓存只保存凭据哈希，存放在内存中。
+
+持有 native checkpoint 时，能力拒绝会取消压缩并保留会话。凭据拒绝、额度耗尽、速率限制、
+普通访问拒绝、模型不存在、传输失败和响应损坏同样保留错误，供用户处理后重试。
 
 ## 请求和状态
 
@@ -58,14 +78,12 @@ OAuth 原生 checkpoint 在可获得账户标识时保存其哈希，并使用�
 - 压缩输出：验证完整 `output` 是单个含非空 `encrypted_content` 的 `compaction` 项，
   原样写入 Pi compaction entry 的 `details`，包括提供方附加字段。
 - 原生恢复：根据上表选择 `/responses`，以完整 opaque output 为输入开头，随后发送当前
-  system/developer 指令和新增消息。已进入压缩项的旧历史由 checkpoint 替换。
+  system/developer 指令和新增消息。checkpoint 替代已经压缩的对话内容。
 - 再次压缩：提交上次 opaque output 与之后累积的内容。
 - 恢复范围：checkpoint 绑定 provider、模型 ID、Responses API 和规范化端点地址。
   切换路由时 Pi 显示提示及保留的近期消息；回到原路由可恢复 opaque 回放。
 - 失败、取消或请求期间切换会话：取消本次压缩，保留原会话。
   请求超时为 5 分钟，响应上限为 8 MiB，失败后可手动重试 `/compact`。
-
-原生压缩失败时保留历史并提示原因，区分凭据拒绝、权限不足、付费额度耗尽和免费用量耗尽。
 
 ## 离线验证
 
@@ -77,8 +95,8 @@ bash scripts/check.sh
 检查 TypeScript，并运行 Node 自带测试。Pi 版本为 0.84.2。
 测试覆盖真实 Pi SessionManager 的 JSONL 写入与重开、Responses transport 请求重写、
 重复压缩、工具消息配对、路由隔离、错误与取消，以及 OAuth 刷新、原生恢复路径、
-免费账户的 Pi 内置摘要和第三方 provider 注册兼容性。模型响应使用本地测试数据。
-当前验证范围为离线协议与 Pi 会话行为；真实订阅链路的端到端兼容性仍需实测确认。
+免费账户的 Pi 内置摘要、能力拒绝缓存、认证来源保护、v1/v2 校验和第三方 provider
+注册兼容性。模型响应使用测试数据，验证结论限于离线协议与 Pi 会话行为。
 
 ## 协议依据
 

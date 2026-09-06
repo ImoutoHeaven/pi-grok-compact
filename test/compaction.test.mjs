@@ -101,6 +101,8 @@ test("native compact -> actual Pi JSONL reopen -> Responses replay -> recompact"
   assert.ok(JSON.stringify(compactInputs[0]).includes("ORCHID-739"));
   h.persist(result);
   const restored = latestCheckpoint(h.ctx.sessionManager.getBranch());
+  assert.equal(restored.version, 2);
+  assert.equal(restored.authKind, "non-oauth");
   assert.deepEqual(restored.output, opaque);
   assert.equal(restored.route, routeIdentity(model));
   const disk = await readFile(h.ctx.sessionManager.getSessionFile(), "utf8");
@@ -354,7 +356,7 @@ test("a changed OAuth account or a free downgrade cannot silently replay a paid 
 
 test("OAuth permission and quota failures stay distinct and sanitized", async t => {
   for (const [status, code, message] of [
-    [401, "auth", /sign in again/], [403, "forbidden", /lacks access/],
+    [401, "auth", /sign in again/], [403, "forbidden", /request failed/],
     [402, "billing", /spending limit/], [429, "subscription:free-usage-exhausted", /Free usage exhausted/],
   ]) {
     let calls = 0;
@@ -410,4 +412,162 @@ test("real Pi registry retains third-party OAuth login and refresh after stream 
   assert.equal(registrations, 2);
   assert.equal(registry.getRegisteredProviderConfig(activeModel.provider).oauth, oauth);
   await runtime.refresh({ allowNetwork: false });
+});
+
+test("unknown OAuth entitlement denial falls back and caches only the current credential and session", async t => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  let calls = 0;
+  const h = await harness(t, async () => {
+    calls++;
+    return Response.json({ error: { code: "entitlement_unavailable", message: "private error body" } }, { status: 403 });
+  });
+  useOAuth(h, undefined);
+  h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "opaque-credential-one" });
+  assert.equal(await h.compact(), undefined);
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 1);
+  h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "opaque-credential-two" });
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 2);
+  h.ctx.model = { ...h.ctx.model, id: "grok-4.5" };
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 3);
+  h.ctx.model = { ...h.ctx.model, id: "grok-4.6" };
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 3);
+  now += 5 * 60_000 + 1;
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 4);
+  await h.handlers.get("session_start")({}, h.ctx);
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 5);
+  const switched = SessionManager.inMemory();
+  for (const entry of h.ctx.sessionManager.getBranch()) if (entry.type === "message") switched.appendMessage(entry.message);
+  h.ctx.sessionManager = switched;
+  assert.equal(await h.compact(), undefined);
+  assert.equal(calls, 6);
+  assert.ok(!JSON.stringify(h.notifications).includes("private error body"));
+});
+
+test("fallback requires explicit native capability denial, direct OAuth and no checkpoint", async t => {
+  for (const [status, error, fallback] of [
+    [403, { code: "entitlement_unavailable" }, true],
+    [403, { message: "Native compaction entitlement unavailable" }, true],
+    [404, { code: "unsupported_endpoint" }, true],
+    [403, { code: "forbidden", message: "Access denied" }, false],
+    [403, { code: "content_policy_violation", message: "Native compaction entitlement unavailable" }, false],
+    [404, { code: "model_not_found" }, false],
+    [401, { code: "entitlement_unavailable" }, false],
+    [402, { code: "entitlement_unavailable" }, false],
+    [429, { code: "rate_limit_exceeded" }, false],
+    [500, { code: "internal_error" }, false],
+  ]) {
+    const h = await harness(t, async () => Response.json({ error }, { status }));
+    useOAuth(h, undefined);
+    assert.deepEqual(await h.compact(), fallback ? undefined : { cancel: true }, `${status}/${error.code ?? error.message}`);
+  }
+  const relay = await harness(t, async () => Response.json({ error: { code: "unsupported_endpoint" } }, { status: 404 }));
+  relay.ctx.modelRegistry.isUsingOAuth = () => true;
+  assert.deepEqual(await relay.compact(), { cancel: true });
+  relay.ctx.model = { ...relay.ctx.model, baseUrl: "https://api.x.ai/v1" };
+  relay.ctx.modelRegistry.isUsingOAuth = () => false;
+  assert.deepEqual(await relay.compact(), { cancel: true });
+  const malformed = await harness(t, async () => Response.json({ object: "response.compaction", output: [] }));
+  useOAuth(malformed, undefined);
+  assert.deepEqual(await malformed.compact(), { cancel: true });
+
+  let denied = false;
+  const prior = await harness(t, async () => denied
+    ? Response.json({ error: { code: "entitlement_unavailable" } }, { status: 403 }) : Response.json(envelope));
+  useOAuth(prior, undefined);
+  prior.persist(await prior.compact());
+  prior.ctx.sessionManager.appendMessage(user("Continue"));
+  prior.ctx.sessionManager.appendMessage(assistant("Answer"));
+  denied = true;
+  const before = JSON.stringify(prior.ctx.sessionManager.getBranch());
+  assert.deepEqual(await prior.compact(), { cancel: true });
+  assert.equal(JSON.stringify(prior.ctx.sessionManager.getBranch()), before);
+});
+
+test("a capability rejection after a concurrent turn does not start fallback", async t => {
+  let h;
+  h = await harness(t, async () => {
+    h.ctx.sessionManager.appendMessage(user("Concurrent turn"));
+    return Response.json({ error: { code: "entitlement_unavailable" } }, { status: 403 });
+  });
+  useOAuth(h, undefined);
+  assert.deepEqual(await h.compact(), { cancel: true });
+});
+
+test("OAuth provenance survives opaque tokens, missing subjects, restart and API-key switches", async t => {
+  for (const credential of ["opaque-oauth-token", `${Buffer.from('{}').toString('base64url')}.${Buffer.from('{"tier":1}').toString('base64url')}.fixture`]) {
+    const h = await harness(t, async () => Response.json(envelope));
+    useOAuth(h, undefined);
+    h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: credential });
+    const result = await h.compact();
+    assert.equal(result.compaction.details.version, 2);
+    assert.equal(result.compaction.details.authKind, "oauth");
+    assert.equal(result.compaction.details.oauthAccount, undefined);
+    h.persist(result);
+    h.ctx.sessionManager.appendMessage(user("Resume"));
+    assert.deepEqual(await inference(h, credential, async () => sseAnswer()), []);
+    assert.match(JSON.stringify(h.notifications), /account identity|account consistency/);
+    assert.deepEqual(await inference(h, credential, async () => sseAnswer()), []);
+    assert.equal(h.notifications.filter(([text]) => text.includes("account consistency")).length, 1);
+    h.ctx.modelRegistry.isUsingOAuth = () => false;
+    h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "new-api-key" });
+    const errors = await inference(h, "new-api-key", async () => assert.fail("OAuth blob escaped to API-key transport"));
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /OAuth login/);
+    assert.deepEqual(await h.compact(), { cancel: true });
+  }
+});
+
+test("checkpoint provenance follows Pi authentication even on a custom OAuth gateway", async t => {
+  const h = await harness(t, async () => Response.json(envelope));
+  h.ctx.modelRegistry.isUsingOAuth = () => true;
+  const result = await h.compact();
+  assert.equal(result.compaction.details.authKind, "oauth");
+  h.persist(result);
+  h.ctx.sessionManager.appendMessage(user("Resume"));
+  h.ctx.modelRegistry.isUsingOAuth = () => false;
+  const errors = await inference(h, "new-api-key", async () => assert.fail("gateway OAuth blob escaped"));
+  assert.equal(errors.length, 1);
+  assert.deepEqual(await h.compact(), { cancel: true });
+});
+
+test("v1 OAuth fingerprints support replay; unknown v1 provenance blocks automatic reuse", async t => {
+  for (const [known, direct] of [[true, true], [false, true], [false, false]]) {
+    const h = await harness(t, async () => Response.json(envelope));
+    const credential = direct ? useOAuth(h, 1) : "test-relay-key";
+    const result = await h.compact();
+    result.compaction.details.version = 1;
+    delete result.compaction.details.authKind;
+    if (!known) delete result.compaction.details.oauthAccount;
+    h.persist(result);
+    h.ctx.sessionManager.appendMessage(user("Resume v1 checkpoint"));
+    const errors = await inference(h, credential, async () => {
+      assert.ok(known, "v1 checkpoint with unknown provenance reached HTTP");
+      return sseAnswer();
+    });
+    assert.equal(errors.length, known ? 0 : 1);
+    if (!known) {
+      assert.match(errors[0], /v1/);
+      assert.deepEqual(await h.compact(), { cancel: true });
+    }
+  }
+});
+
+test("v2 parsing requires explicit, consistent authentication provenance", async t => {
+  const h = await harness(t, async () => Response.json(envelope));
+  const result = await h.compact();
+  const details = result.compaction.details;
+  for (const patch of [
+    { authKind: undefined }, { authKind: "unknown" }, { version: 3 },
+    { authKind: "non-oauth", oauthAccount: "a".repeat(64) },
+    { version: 1, authKind: "non-oauth" },
+  ]) {
+    assert.throws(() => latestCheckpoint([{ type: "compaction", details: { ...details, ...patch } }]), /metadata is invalid/);
+  }
 });
