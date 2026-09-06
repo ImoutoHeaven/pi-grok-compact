@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { stream, streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import { createGrokCompaction } from "../src/index.ts";
-import { latestCheckpoint, MAX_BYTES, replay, validateOutput } from "../src/checkpoint.ts";
+import { createCheckpoint, latestCheckpoint, MAX_BYTES, replay, summary as checkpointSummary, validateOutput } from "../src/checkpoint.ts";
 import { isGrok, requestCompaction, resolveRoute, routeIdentity } from "../src/remote.ts";
 import { createOAuthReplayRouter, oauthState, oauthCompactRoute } from "../src/oauth.ts";
 
@@ -171,7 +171,8 @@ test("session changes in flight discard the result, and other routes never recei
   for (const changed of [{ ...model, id: "grok-other" }, { ...model, provider: "other" }, { ...model, baseUrl: "https://different.example/v1" }, { ...model, id: "gpt-6" }]) {
     valid.ctx.model = changed;
     assert.equal(valid.handlers.get("context")({ messages: buildSessionContext(valid.ctx.sessionManager.getBranch()).messages }, valid.ctx), undefined);
-    assert.equal(valid.handlers.get("before_provider_request")({ payload: { input: [] } }, valid.ctx), undefined);
+    const untouched = valid.handlers.get("before_provider_request")({ payload: { input: [] } }, valid.ctx);
+    assert.equal(JSON.stringify(untouched ?? { input: [] }), '{"input":[]}');
   }
   valid.ctx.model = { ...model, provider: "other" };
   valid.ctx.sessionManager.appendMessage(user("A turn on the other route"));
@@ -393,7 +394,7 @@ test("real Pi registry retains third-party OAuth login and refresh after stream 
   assert.ok(activeModel);
   assert.equal(registry.isUsingOAuth(activeModel), true);
   let registrations = 0;
-  const install = createOAuthReplayRouter({ registerProvider: (id, config) => { registrations++; registry.registerProvider(id, config); } });
+  const { install } = createOAuthReplayRouter({ registerProvider: (id, config) => { registrations++; registry.registerProvider(id, config); } });
   const ctx = { model: activeModel, modelRegistry: registry, sessionManager: { getBranch: () => [] } };
   install(ctx);
   await runtime.refresh({ allowNetwork: false });
@@ -570,4 +571,66 @@ test("v2 parsing requires explicit, consistent authentication provenance", async
   ]) {
     assert.throws(() => latestCheckpoint([{ type: "compaction", details: { ...details, ...patch } }]), /metadata is invalid/);
   }
+});
+
+test("real Pi runner invalidation preserves OAuth replay across reload, fork and resume", async t => {
+  const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+  const entry = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const { ModelRegistry } = await import(new URL("./core/model-registry.js", entry));
+  const { ExtensionRunner } = await import(new URL("./core/extensions/runner.js", entry));
+  const { loadExtensions } = await import(new URL("./core/extensions/loader.js", entry));
+  const directory = await mkdtemp(join(tmpdir(), "grok-lifecycle-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const token = oauthToken(1);
+  const authPath = join(directory, "auth.json");
+  await writeFile(authPath, JSON.stringify({ "test-oauth": { type: "oauth", access: token, refresh: "test-refresh", expires: Date.now() + 3_600_000 } }));
+  const runtime = await ModelRuntime.create({ authPath, modelsPath: join(directory, "models.json"), modelsStorePath: join(directory, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
+  const registry = new ModelRegistry(runtime);
+  runtime.registerProvider("test-oauth", {
+    api: "openai-responses", baseUrl: "https://cli-chat-proxy.grok.com/v1", models: [{ ...model, baseUrl: "https://cli-chat-proxy.grok.com/v1" }],
+    oauth: { name: "Test OAuth", login: async () => assert.fail("unexpected login"), refreshToken: async value => value, getApiKey: value => value.access },
+    streamSimple,
+  });
+  await runtime.refresh({ allowNetwork: false });
+  const activeModel = registry.find("test-oauth", model.id);
+  const manager = SessionManager.inMemory();
+  manager.appendMessage(user("Before compaction"));
+  const retained = assistant("Retained");
+  const kept = manager.appendMessage(retained);
+  const details = createCheckpoint(routeIdentity(activeModel), opaque, [retained], "oauth", oauthState(activeModel, { apiKey: token }, true).account);
+  manager.appendCompaction(checkpointSummary(details.checkpointId), kept, 10000, details, true);
+  manager.appendMessage(user("Resume from the checkpoint"));
+  let sent = 0;
+  for (const reason of ["reload", "fork", "resume", "quit"]) {
+    const loaded = await loadExtensions([fileURLToPath(new URL("../src/index.ts", import.meta.url))], directory);
+    assert.deepEqual(loaded.errors, []);
+    loaded.runtime.registerProvider = (id, config) => registry.registerProvider(id, config);
+    const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, directory, manager, registry);
+    runner.getModel = () => activeModel;
+    await runner.emit({ type: "session_start", reason: "startup" });
+    const ctx = runner.createContext();
+    const messages = await runner.emitContext(buildSessionContext(manager.getBranch()).messages);
+    const events = registry.getProvider(activeModel.provider).streamSimple(activeModel, { messages: convertToLlm(messages) }, {
+      apiKey: token, maxRetries: 0, onPayload: payload => runner.emitBeforeProviderRequest(payload),
+      fetch: async (url, init) => {
+        assert.equal(String(url), "https://api.x.ai/v1/responses");
+        assert.deepEqual(JSON.parse(init.body).input[0], opaque[0]);
+        assert.ok(!init.body.includes(details.oauthAccount));
+        sent++;
+        return sseAnswer();
+      },
+    });
+    const errors = [];
+    for await (const event of events) if (event.type === "error") errors.push(event.error.errorMessage);
+    assert.deepEqual(errors, [], reason);
+    if (reason !== "fork") {
+      const wrapped = registry.getRegisteredProviderConfig(activeModel.provider).streamSimple;
+      await runner.emit({ type: "session_shutdown", reason });
+      assert.notEqual(registry.getRegisteredProviderConfig(activeModel.provider).streamSimple, wrapped);
+    }
+    runner.invalidate();
+    assert.throws(() => ctx.modelRegistry, /extension ctx is stale/);
+  }
+  assert.equal(sent, 4);
+  await runtime.refresh({ allowNetwork: false });
 });

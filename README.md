@@ -59,6 +59,9 @@ checkpoint 使用 v2 格式，`authKind` 记录 Pi 的认证类型，包括自�
 native checkpoint 要求具备原生压缩权限的账户；免费账户使用可读摘要会话。
 会话日志保留在磁盘上。
 
+认证与 checkpoint 检查使用每次请求的会话数据。`/reload`、会话关闭和恢复时，
+扩展管理自身的 transport 包装，保留 provider 的登录与刷新配置。
+
 ## 能力拒绝与摘要回退
 
 直接 OAuth 账户尚无 native checkpoint 时，明确的 compact entitlement 拒绝或
@@ -96,7 +99,11 @@ bash scripts/check.sh
 测试覆盖真实 Pi SessionManager 的 JSONL 写入与重开、Responses transport 请求重写、
 重复压缩、工具消息配对、路由隔离、错误与取消，以及 OAuth 刷新、原生恢复路径、
 免费账户的 Pi 内置摘要、能力拒绝缓存、认证来源保护、v1/v2 校验和第三方 provider
-注册兼容性。模型响应使用测试数据，验证结论限于离线协议与 Pi 会话行为。
+注册兼容性，以及 Pi runner 失效后的重载、fork 与恢复。自动化脚本的模型响应使用测试数据。
+
+付费 OAuth 的真实接口验证覆盖普通推理、原生压缩、`/reload` 后恢复和新 session ID
+恢复；恢复请求以原样 opaque checkpoint 承载早期验证信息。免费账户与第三方中转的
+验证范围为离线协议和 Pi 会话行为。
 
 ## 协议依据
 

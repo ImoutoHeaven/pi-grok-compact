@@ -77,41 +77,62 @@ export function assertCheckpointAuth(checkpoint: Checkpoint, usingOAuth: boolean
   }
 }
 
-export function createOAuthReplayRouter(pi: ExtensionAPI): (ctx: ExtensionContext) => void {
-  const installed = new Map<string, ProviderConfig["streamSimple"]>();
+type Stream = NonNullable<ProviderConfig["streamSimple"]>;
+const ORIGINAL_STREAM = Symbol.for("pi-grok-compaction.original-stream");
+const REQUEST_POLICY = Symbol.for("pi-grok-compaction.request-policy");
+type WrappedStream = Stream & { [ORIGINAL_STREAM]?: Stream };
+type RequestPolicy = { usingOAuth: boolean; checkpoint?: Checkpoint };
+
+export function createOAuthReplayRouter(pi: ExtensionAPI) {
+  const installed = new Map<string, { stream: Stream; original: Stream; registry: ExtensionContext["modelRegistry"] }>();
   let warningSession: string | undefined;
   const warned = new Set<string>();
-  return ctx => {
+  const prepare = (payload: unknown, ctx: ExtensionContext, checkpoint?: Checkpoint) => {
+    if (!isObject(payload)) throw new GrokCompactionError("Grok replay requires a Responses payload");
+    const model = ctx.model;
+    if (!isGrok(model)) return payload;
+    const usingOAuth = ctx.modelRegistry.isUsingOAuth(model);
+    if (checkpoint && checkpointAuthKind(checkpoint) === "oauth" && !checkpoint.oauthAccount && usingOAuth) {
+      const session = ctx.sessionManager.getSessionId();
+      if (warningSession !== session) { warned.clear(); warningSession = session; }
+      if (!warned.has(checkpoint.checkpointId)) {
+        ctx.ui.notify("OAuth checkpoint has no stable account identity. Keep using the original account; account consistency cannot be verified.", "warning");
+        warned.add(checkpoint.checkpointId);
+      }
+    }
+    // Symbols survive object spreads and stay out of the serialized HTTP body.
+    return { ...payload, [REQUEST_POLICY]: { usingOAuth, checkpoint } satisfies RequestPolicy };
+  };
+  const install = (ctx: ExtensionContext) => {
     const model = ctx.model;
     if (!isGrok(model)) return;
+    const registry = ctx.modelRegistry;
     const active = latestCheckpoint(ctx.sessionManager.getBranch());
     const needsGuard = active && active.route === routeIdentity(model) && checkpointAuthKind(active) !== "non-oauth";
-    if (!isDirectOAuth(model, ctx.modelRegistry.isUsingOAuth(model)) && !needsGuard) return;
-    const config = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
-    if (installed.has(model.provider) && config?.streamSimple === installed.get(model.provider)) return;
-    const original = ctx.modelRegistry.getProvider(model.provider);
-    if (!original) return;
-    const streamSimple: NonNullable<ProviderConfig["streamSimple"]> = (currentModel, context, options = {}) => {
+    if (!isDirectOAuth(model, registry.isUsingOAuth(model)) && !needsGuard) return;
+    const config = registry.getRegisteredProviderConfig(model.provider);
+    if (config?.streamSimple && config.streamSimple === installed.get(model.provider)?.stream) return;
+    const provider = registry.getProvider(model.provider);
+    if (!provider) return;
+    const original = (config?.streamSimple as WrappedStream | undefined)?.[ORIGINAL_STREAM] ?? provider.streamSimple.bind(provider);
+    const streamSimple: WrappedStream = (currentModel, context, options = {}) => {
       let destination: string | undefined;
-      return original.streamSimple(currentModel, context, {
+      return original(currentModel, context, {
         ...options,
         onPayload: async (payload, requestModel) => {
+          options.signal?.throwIfAborted();
           const next = await options.onPayload?.(payload, requestModel) ?? payload;
-          const usingOAuth = ctx.modelRegistry.isUsingOAuth(currentModel);
+          options.signal?.throwIfAborted();
+          const policy = isObject(next) ? (next as { [REQUEST_POLICY]?: RequestPolicy })[REQUEST_POLICY] : undefined;
+          const usingOAuth = policy?.usingOAuth ?? registry.isUsingOAuth(currentModel);
           const state = oauthState(currentModel, options, usingOAuth);
           destination = state?.tier === "free" ? XAI_CLI : undefined;
-          const checkpoint = latestCheckpoint(ctx.sessionManager.getBranch());
-          if (checkpoint && checkpoint.route === routeIdentity(currentModel) &&
-              isObject(next) && Array.isArray(next.input) && next.input.some(item => isObject(item) && item.type === "compaction")) {
-            assertCheckpointAuth(checkpoint, usingOAuth, state);
-            if (checkpointAuthKind(checkpoint) === "oauth" && !checkpoint.oauthAccount) {
-              const session = ctx.sessionManager.getSessionId();
-              if (warningSession !== session) { warned.clear(); warningSession = session; }
-              if (!warned.has(checkpoint.checkpointId)) {
-                ctx.ui.notify("OAuth checkpoint has no stable account identity. Keep using the original account; account consistency cannot be verified.", "warning");
-                warned.add(checkpoint.checkpointId);
-              }
+          if (isObject(next) && Array.isArray(next.input) && next.input.some(item => isObject(item) && item.type === "compaction")) {
+            const checkpoint = policy?.checkpoint;
+            if (!checkpoint || checkpoint.route !== routeIdentity(currentModel)) {
+              throw new GrokCompactionError("Grok checkpoint request metadata is missing; reload the compaction extension before replaying.");
             }
+            assertCheckpointAuth(checkpoint, usingOAuth, state);
             if (state) {
               destination = XAI_API;
             }
@@ -133,7 +154,18 @@ export function createOAuthReplayRouter(pi: ExtensionAPI): (ctx: ExtensionContex
         },
       });
     };
+    streamSimple[ORIGINAL_STREAM] = original;
     pi.registerProvider(model.provider, { api: "openai-responses", streamSimple });
-    installed.set(model.provider, streamSimple);
+    installed.set(model.provider, { stream: streamSimple, original, registry });
   };
+  const dispose = () => {
+    for (const [id, entry] of installed) {
+      if (entry.registry.getRegisteredProviderConfig(id)?.streamSimple === entry.stream) {
+        entry.registry.registerProvider(id, { api: "openai-responses", streamSimple: entry.original });
+      }
+    }
+    installed.clear();
+    warned.clear();
+  };
+  return { install, prepare, dispose };
 }

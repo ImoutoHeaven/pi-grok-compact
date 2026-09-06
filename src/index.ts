@@ -17,7 +17,7 @@ export function createGrokCompaction(options: {
   fetch?: typeof globalThis.fetch;
 } = {}) {
   return (pi: ExtensionAPI) => {
-    const installReplayRouter = createOAuthReplayRouter(pi);
+    const router = createOAuthReplayRouter(pi);
     let capabilitySession: string | undefined;
     const unavailable = new Map<string, number>();
     const active = (ctx: ExtensionContext) => latestCheckpoint(ctx.sessionManager.getBranch());
@@ -47,7 +47,7 @@ export function createGrokCompaction(options: {
         const usingOAuth = ctx.modelRegistry.isUsingOAuth(model);
         const oauth = oauthState(model, auth, usingOAuth);
         if (prior) assertCheckpointAuth(prior, usingOAuth, oauth);
-        installReplayRouter(ctx);
+        router.install(ctx);
         if (oauth?.tier === "free") {
           ctx.ui.notify("Free/X Basic OAuth account: using Pi's built-in prompt-summary compaction.", "info");
           return undefined;
@@ -96,20 +96,21 @@ export function createGrokCompaction(options: {
     });
 
     pi.on("context", (event, ctx) => {
-      installReplayRouter(ctx);
+      router.install(ctx);
       const checkpoint = active(ctx);
       if (!checkpoint || !compatible(ctx, checkpoint.route)) return;
       return { messages: projectMessages(event.messages, checkpoint) };
     });
 
     pi.on("before_provider_request", (event, ctx) => {
+      if (!isGrok(ctx.model)) return;
       const checkpoint = active(ctx);
-      if (!checkpoint || !compatible(ctx, checkpoint.route)) return;
-      return replay(event.payload, checkpoint);
+      const current = checkpoint && compatible(ctx, checkpoint.route) ? checkpoint : undefined;
+      return router.prepare(current ? replay(event.payload, current) : event.payload, ctx, current);
     });
 
     const warnRoute = (_event: unknown, ctx: ExtensionContext) => {
-      installReplayRouter(ctx);
+      router.install(ctx);
       const checkpoint = active(ctx);
       if (checkpoint && !compatible(ctx, checkpoint.route)) {
         ctx.ui.notify("Grok checkpoint replay requires its original provider, model and endpoint. This route receives only the fallback marker and retained recent messages.", "warning");
@@ -117,6 +118,7 @@ export function createGrokCompaction(options: {
     };
     pi.on("model_select", warnRoute);
     pi.on("session_start", (event, ctx) => { unavailable.clear(); warnRoute(event, ctx); });
+    pi.on("session_shutdown", () => { unavailable.clear(); router.dispose(); });
   };
 }
 
