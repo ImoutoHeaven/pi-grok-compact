@@ -86,7 +86,8 @@ endpoint 不支持会交给 Pi 内置摘要。未知等级先尝试 native；能
 - 恢复范围：checkpoint 绑定 provider、模型 ID、Responses API 和规范化端点地址。
   切换路由时 Pi 显示提示及保留的近期消息；回到原路由可恢复 opaque 回放。
 - 失败、取消或请求期间切换会话：取消本次压缩，保留原会话。
-  请求超时为 5 分钟，响应上限为 8 MiB，失败后可手动重试 `/compact`。
+  请求超时为 5 分钟，HTTP 响应与持久化 output 的上限均为 64 MiB，支持包含图片数据的
+  opaque checkpoint。HTTP 响应超限时提示具体上限并保留会话。
 
 ## 离线验证
 

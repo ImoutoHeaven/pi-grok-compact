@@ -4,7 +4,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export type Item = Record<string, unknown>;
-export const MAX_BYTES = 8 * 1024 * 1024;
+// Native opaque checkpoints can contain image data; bound HTTP reads and persisted output together.
+export const MAX_BYTES = 64 * 1024 * 1024;
 const KIND = "pi-grok-native-compaction";
 
 export type AuthKind = "oauth" | "non-oauth";

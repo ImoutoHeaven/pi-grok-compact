@@ -97,7 +97,7 @@ async function readJson(response: Response): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       bytes += value.byteLength;
-      if (bytes > MAX_BYTES) throw new Error("xAI compaction response exceeded 8 MiB");
+      if (bytes > MAX_BYTES) throw new GrokCompactionError(`xAI compaction response exceeded ${MAX_BYTES / 1024 / 1024} MiB; history retained.`);
       chunks.push(value);
     }
   } catch (error) {

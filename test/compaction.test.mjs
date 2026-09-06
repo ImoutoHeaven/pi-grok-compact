@@ -634,3 +634,21 @@ test("real Pi runner invalidation preserves OAuth replay across reload, fork and
   assert.equal(sent, 4);
   await runtime.refresh({ allowNetwork: false });
 });
+
+test("large multimodal-sized compaction output survives native read, persistence and replay", async t => {
+  const encrypted = "synthetic-opaque-" + "a".repeat(12 * 1024 * 1024);
+  const output = [{ type: "compaction", id: "cmp_large", encrypted_content: encrypted }];
+  const h = await harness(t, async () => Response.json({ object: "response.compaction", output }));
+  const result = await h.compact();
+  assert.ok(result.compaction);
+  h.persist(result);
+  assert.equal(latestCheckpoint(h.ctx.sessionManager.getBranch()).output[0].encrypted_content, encrypted);
+  h.ctx.sessionManager.appendMessage(user("Resume from the large checkpoint"));
+  let sent = false;
+  assert.deepEqual(await inference(h, "test-relay-key", async (_url, init) => {
+    assert.equal(JSON.parse(init.body).input[0].encrypted_content, encrypted);
+    sent = true;
+    return sseAnswer();
+  }), []);
+  assert.equal(sent, true);
+});
