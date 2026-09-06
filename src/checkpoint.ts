@@ -14,6 +14,7 @@ export interface Checkpoint {
   route: string;
   output: Item[];
   keptMessageFingerprints: string[];
+  oauthAccount?: string;
 }
 
 export function isObject(value: unknown): value is Item {
@@ -48,10 +49,11 @@ export function marker(id: string): string {
   return `[PI_GROK_CHECKPOINT:${id}] Opaque history requires pi-grok-compaction on the original route. Report unavailable history if this marker reaches the model.`;
 }
 
-export function createCheckpoint(route: string, output: unknown, kept: readonly AgentMessage[]): Checkpoint {
+export function createCheckpoint(route: string, output: unknown, kept: readonly AgentMessage[], oauthAccount?: string): Checkpoint {
   return {
     kind: KIND, version: 1, checkpointId: randomUUID(), route,
     output: validateOutput(output), keptMessageFingerprints: kept.map(fingerprint),
+    ...(oauthAccount ? { oauthAccount } : {}),
   };
 }
 
@@ -63,6 +65,7 @@ export function latestCheckpoint(entries: readonly SessionEntry[]): Checkpoint |
     if (!isObject(value) || value.kind !== KIND) return undefined;
     if (value.version !== 1 || typeof value.checkpointId !== "string" ||
         !/^[a-f0-9-]{36}$/.test(value.checkpointId) || typeof value.route !== "string" ||
+        (value.oauthAccount !== undefined && (typeof value.oauthAccount !== "string" || !/^[a-f0-9]{64}$/.test(value.oauthAccount))) ||
         !Array.isArray(value.keptMessageFingerprints) ||
         !value.keptMessageFingerprints.every(v => typeof v === "string" && /^[a-f0-9]{64}$/.test(v))) {
       throw new Error("Grok checkpoint metadata is invalid; restore the session before compacting");

@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
-  SessionManager, buildSessionContext, convertToLlm,
+  SessionManager, buildSessionContext, convertToLlm, compact as piCompact,
 } from "@earendil-works/pi-coding-agent";
-import { stream } from "@earendil-works/pi-ai/api/openai-responses";
+import { stream, streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
 import { createGrokCompaction } from "../src/index.ts";
 import { latestCheckpoint, MAX_BYTES, replay, validateOutput } from "../src/checkpoint.ts";
 import { isGrok, requestCompaction, resolveRoute, routeIdentity } from "../src/remote.ts";
+import { createOAuthReplayRouter, oauthState, oauthCompactRoute } from "../src/oauth.ts";
 
 // Pi 0.84.2's internal cut-point calculation supplies realistic compaction events.
 const { prepareCompaction } = await import(new URL("./core/compaction/compaction.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
@@ -46,15 +47,25 @@ async function harness(t, fetch) {
   manager.appendMessage(assistant("Read complete"));
   const handlers = new Map();
   const notifications = [];
+  let provider = { stream, streamSimple };
+  let registered = {};
   const ctx = {
     model, sessionManager: manager, getSystemPrompt: () => "Keep the secret code.",
     modelRegistry: {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-relay-key" }),
-      getProvider: () => ({ stream }),
+      getProvider: () => provider,
+      isUsingOAuth: () => false,
+      getRegisteredProviderConfig: () => registered,
     },
     ui: { setStatus() {}, notify: (...args) => notifications.push(args) },
   };
-  createGrokCompaction({ fetch })({ on: (event, handler) => handlers.set(event, handler) });
+  createGrokCompaction({ fetch })({
+    on: (event, handler) => handlers.set(event, handler),
+    registerProvider: (_id, config) => {
+      registered = { ...registered, ...config };
+      provider = { stream: config.streamSimple, streamSimple: config.streamSimple };
+    },
+  });
   const compact = async (signal = new AbortController().signal) => {
     const entries = ctx.sessionManager.getBranch();
     const preparation = prepareCompaction(entries, { enabled: true, reserveTokens: 1024, keepRecentTokens: 1 });
@@ -200,4 +211,203 @@ test("strict output, marker and response size checks", async () => {
     signal: new AbortController().signal,
     fetch: async () => new Response("x".repeat(MAX_BYTES + 1)),
   }), /exceeded/);
+});
+
+function oauthToken(tier, sub = "test-account", refresh = 1) {
+  const encode = value => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode({ iss: "https://auth.x.ai", sub, team_id: "test-team", tier, refresh })}.fixture`;
+}
+
+function useOAuth(h, tier, baseUrl = "https://cli-chat-proxy.grok.com/v1", sub = "test-account", refresh = 1) {
+  h.ctx.model = { ...model, provider: "third-party-oauth", baseUrl,
+    headers: { "x-grok-client-version": "0.2.101", "x-xai-token-auth": "xai-grok-cli" } };
+  const token = oauthToken(tier, sub, refresh);
+  h.ctx.modelRegistry.isUsingOAuth = () => true;
+  h.ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: token });
+  return token;
+}
+
+function sseAnswer(text = "Summary from Pi") {
+  const item = { type: "message", id: "msg_test", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+  const events = [
+    { type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
+    { type: "response.content_part.added", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { status: "completed", output: [item], usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } } },
+  ];
+  return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+}
+
+async function inference(h, token, fetch, applyCheckpoint = true) {
+  const context = buildSessionContext(h.ctx.sessionManager.getBranch());
+  const projected = applyCheckpoint ? await h.handlers.get("context")({ messages: context.messages }, h.ctx) : undefined;
+  const events = h.ctx.modelRegistry.getProvider().streamSimple(h.ctx.model, {
+    systemPrompt: h.ctx.getSystemPrompt(), messages: convertToLlm(projected?.messages ?? context.messages),
+  }, {
+    apiKey: token, maxRetries: 0, fetch,
+    onPayload: applyCheckpoint ? payload => h.handlers.get("before_provider_request")({ payload }, h.ctx) : undefined,
+  });
+  const errors = [];
+  for await (const event of events) if (event.type === "error") errors.push(event.error.errorMessage);
+  return errors;
+}
+
+test("direct OAuth paid compaction and restarted replay use official API with refreshed credentials", async t => {
+  const compactCalls = [];
+  const h = await harness(t, async (url, options) => {
+    compactCalls.push({ url, options });
+    assert.equal(url, "https://api.x.ai/v1/responses/compact");
+    assert.equal(options.headers.has("x-grok-client-version"), false);
+    return Response.json(envelope);
+  });
+  const initial = useOAuth(h, 1);
+  h.persist(await h.compact());
+  assert.equal(compactCalls[0].options.headers.get("authorization"), `Bearer ${initial}`);
+  const stored = latestCheckpoint(h.ctx.sessionManager.getBranch());
+  assert.match(stored.oauthAccount, /^[a-f0-9]{64}$/);
+  assert.ok(!JSON.stringify(stored).includes(initial));
+  assert.ok(!JSON.stringify(stored).includes("test-account"));
+  h.ctx.sessionManager.appendMessage(user("Continue using native history"));
+  const refreshed = useOAuth(h, 1, undefined, undefined, 2);
+  let replayCalls = 0;
+  assert.deepEqual(await inference(h, refreshed, async (url, options) => {
+    replayCalls++;
+    assert.equal(url, "https://api.x.ai/v1/responses");
+    assert.equal(options.headers.get("authorization"), `Bearer ${refreshed}`);
+    assert.equal(options.headers.has("x-xai-token-auth"), false);
+    assert.deepEqual(JSON.parse(options.body).input[0], opaque[0]);
+    return sseAnswer("Continued");
+  }), []);
+  assert.equal(replayCalls, 1);
+  h.ctx.sessionManager.appendMessage(assistant("Continued"));
+  assert.ok((await h.compact()).compaction);
+  assert.deepEqual(JSON.parse(compactCalls[1].options.body).input[0], opaque[0]);
+});
+
+test("free OAuth delegates to actual Pi prompt-summary and resumes through the CLI proxy", async t => {
+  for (const tier of [0, 2, "Free", "X Basic"]) {
+    const h = await harness(t, async () => assert.fail("free account called native compact"));
+    const token = useOAuth(h, tier, "https://api.x.ai/v1");
+    assert.equal(await h.compact(), undefined);
+    const preparation = prepareCompaction(h.ctx.sessionManager.getBranch(), { enabled: true, reserveTokens: 1024, keepRecentTokens: 1 });
+    let summaries = 0;
+    const result = await piCompact(preparation, h.ctx.model, token, undefined, undefined, new AbortController().signal, undefined,
+      (m, context, options) => h.ctx.modelRegistry.getProvider().stream(m, context, {
+        ...options, fetch: async (url, init) => {
+          summaries++;
+          assert.equal(url, "https://cli-chat-proxy.grok.com/v1/responses");
+          assert.equal(init.headers.get("x-xai-token-auth"), "xai-grok-cli");
+          assert.equal(init.headers.get("authorization"), `Bearer ${token}`);
+          const body = JSON.parse(init.body);
+          if (summaries === 1) assert.ok(JSON.stringify(body).includes("ORCHID-739"));
+          assert.ok(!body.input.some(item => item.type === "compaction"));
+          return sseAnswer();
+        },
+      }));
+    assert.equal(summaries, preparation.isSplitTurn ? 2 : 1);
+    assert.ok(result.summary.includes("Summary from Pi"));
+    h.persist({ compaction: result });
+    assert.equal(latestCheckpoint(h.ctx.sessionManager.getBranch()), undefined);
+    h.ctx.sessionManager.appendMessage(user("Continue with the summary"));
+    assert.deepEqual(await inference(h, token, async (url, init) => {
+      assert.equal(url, "https://cli-chat-proxy.grok.com/v1/responses");
+      assert.ok(JSON.stringify(JSON.parse(init.body).input).includes("Summary from Pi"));
+      return sseAnswer("Continued");
+    }), []);
+  }
+});
+
+test("OAuth detection preserves relay routes and treats unknown tiers as unknown", () => {
+  for (const tier of [undefined, null, "future-plan", 999, 0.5]) {
+    const direct = { ...model, baseUrl: "https://api.x.ai/v1" };
+    const auth = { apiKey: oauthToken(tier) };
+    assert.equal(oauthState(direct, auth, true).tier, "unknown");
+    assert.equal(oauthState(model, auth, true), undefined);
+    assert.equal(oauthState(direct, auth, false), undefined);
+  }
+  const state = oauthState({ ...model, baseUrl: "https://cli-chat-proxy.grok.com/v1" }, { apiKey: "opaque-test-token" }, true);
+  assert.equal(state.tier, "unknown");
+  assert.equal(oauthCompactRoute(state).url, "https://api.x.ai/v1/responses/compact");
+});
+
+test("a changed OAuth account or a free downgrade cannot silently replay a paid checkpoint", async t => {
+  const h = await harness(t, async () => Response.json(envelope));
+  useOAuth(h, 1);
+  h.persist(await h.compact());
+  h.ctx.sessionManager.appendMessage(user("Resume"));
+  for (const [tier, account] of [[1, "another-account"], [0, "test-account"]]) {
+    const token = useOAuth(h, tier, undefined, account);
+    const errors = await inference(h, token, async () => assert.fail("invalid account replay reached HTTP"));
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /original|paid account/);
+    const before = JSON.stringify(h.ctx.sessionManager.getBranch());
+    assert.deepEqual(await h.compact(), { cancel: true });
+    assert.equal(JSON.stringify(h.ctx.sessionManager.getBranch()), before);
+  }
+  h.ctx.modelRegistry.isUsingOAuth = () => false;
+  const errors = await inference(h, "test-api-key", async () => assert.fail("OAuth checkpoint was sent with API-key auth"));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /original OAuth login/);
+  assert.deepEqual(await h.compact(), { cancel: true });
+});
+
+test("OAuth permission and quota failures stay distinct and sanitized", async t => {
+  for (const [status, code, message] of [
+    [401, "auth", /sign in again/], [403, "forbidden", /lacks access/],
+    [402, "billing", /spending limit/], [429, "subscription:free-usage-exhausted", /Free usage exhausted/],
+  ]) {
+    let calls = 0;
+    const h = await harness(t, async () => { calls++; return Response.json({ error: { code, message: "private-upstream-text" } }, { status }); });
+    useOAuth(h, 1);
+    assert.deepEqual(await h.compact(), { cancel: true });
+    assert.equal(calls, 1);
+    assert.match(h.notifications.at(-1)[0], message);
+    assert.ok(!JSON.stringify(h.notifications).includes("private-upstream-text"));
+  }
+});
+
+test("real Pi registry retains third-party OAuth login and refresh after stream wrapping", async t => {
+  const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+  const { ModelRegistry } = await import(new URL("./core/model-registry.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
+  const directory = await mkdtemp(join(tmpdir(), "grok-oauth-registry-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const token = oauthToken(1);
+  const authPath = join(directory, "auth.json");
+  await writeFile(authPath, JSON.stringify({ "third-party-oauth": { type: "oauth", access: token, refresh: "test-refresh", expires: Date.now() + 3_600_000 } }));
+  const runtime = await ModelRuntime.create({ authPath, modelsPath: join(directory, "models.json"), modelsStorePath: join(directory, "models-store.json"), allowModelNetwork: false, refreshOnCreate: false });
+  const registry = new ModelRegistry(runtime);
+  const oauth = {
+    name: "Test OAuth", isSubscription: true,
+    login: async () => assert.fail("test must not log in"),
+    refreshToken: async value => value,
+    getApiKey: value => value.access,
+  };
+  let delegates = 0;
+  const original = (m, context, options) => { delegates++; return streamSimple(m, context, options); };
+  runtime.registerProvider("third-party-oauth", { api: "openai-responses", baseUrl: "https://cli-chat-proxy.grok.com/v1", models: [{ ...model, baseUrl: "https://cli-chat-proxy.grok.com/v1" }], oauth, streamSimple: original });
+  await runtime.refresh({ allowNetwork: false });
+  const activeModel = registry.find("third-party-oauth", model.id);
+  assert.ok(activeModel);
+  assert.equal(registry.isUsingOAuth(activeModel), true);
+  let registrations = 0;
+  const install = createOAuthReplayRouter({ registerProvider: (id, config) => { registrations++; registry.registerProvider(id, config); } });
+  const ctx = { model: activeModel, modelRegistry: registry, sessionManager: { getBranch: () => [] } };
+  install(ctx);
+  await runtime.refresh({ allowNetwork: false });
+  install(ctx);
+  assert.equal(registrations, 1);
+  assert.equal(registry.getRegisteredProviderConfig(activeModel.provider).oauth, oauth);
+  assert.equal((await registry.getApiKeyAndHeaders(activeModel)).apiKey, token);
+  const events = registry.getProvider(activeModel.provider).streamSimple(activeModel, { messages: [user("Normal OAuth turn")] }, {
+    apiKey: token, maxRetries: 0,
+    fetch: async url => { assert.equal(String(url), "https://cli-chat-proxy.grok.com/v1/responses"); return sseAnswer(); },
+  });
+  for await (const event of events) assert.notEqual(event.type, "error");
+  assert.equal(delegates, 1);
+  runtime.registerProvider(activeModel.provider, { api: "openai-responses", streamSimple: original });
+  install(ctx);
+  assert.equal(registrations, 2);
+  assert.equal(registry.getRegisteredProviderConfig(activeModel.provider).oauth, oauth);
+  await runtime.refresh({ allowNetwork: false });
 });

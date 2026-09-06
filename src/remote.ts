@@ -5,7 +5,7 @@ export function isGrok(model: Model<Api> | undefined): model is Model<Api> {
   return model?.id.startsWith("grok-") === true && model.api === "openai-responses";
 }
 
-function baseUrl(value: string): string {
+export function baseUrl(value: string): string {
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash ||
       (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) {
@@ -13,6 +13,8 @@ function baseUrl(value: string): string {
   }
   return url.href.replace(/\/+$/, "").replace(/\/responses$/, "");
 }
+
+export class GrokCompactionError extends Error {}
 
 export function routeIdentity(model: Model<Api>): string {
   return JSON.stringify([model.provider, model.api, model.id, baseUrl(model.baseUrl)]);
@@ -100,8 +102,17 @@ export async function requestCompaction(options: {
     body: JSON.stringify({ model: options.model, input: options.input, prompt_cache_key: options.sessionId, instructions: options.instructions }),
   });
   if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new Error(`xAI compaction HTTP ${response.status}; history retained`);
+    let code: unknown;
+    try {
+      const error = await readJson(response);
+      if (isObject(error)) code = isObject(error.error) ? error.error.code : error.code;
+    } catch { /* HTTP status remains available for empty or malformed error bodies. */ }
+    const reason = code === "subscription:free-usage-exhausted" ? "Free usage exhausted; wait for quota recovery" :
+      response.status === 401 ? "OAuth or API credentials were rejected; sign in again" :
+      response.status === 402 ? "Subscription credits or spending limit exhausted" :
+      response.status === 403 ? "The account lacks access to native compaction" :
+      response.status === 429 ? "Rate limited; retry after the provider's cooldown" : "Native compaction request failed";
+    throw new GrokCompactionError(`${reason} (HTTP ${response.status}); history retained.`);
   }
   const data = await readJson(response);
   signal.throwIfAborted();
